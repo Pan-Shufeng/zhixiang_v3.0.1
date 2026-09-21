@@ -1,0 +1,14 @@
+config/*.json
+data/
+logs/
+交付/
+验收/
+backend/checks/
+backend/__pycache__/
+frontend/node_modules/
+packaging/runtime/
+packaging/downloads/
+packaging/builds/
+packaging/license-audit/
+packaging/__pycache__/
+packaging/*.json
