@@ -8,11 +8,20 @@ import os
 import sys
 import time
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener, ProxyHandler
 
 sys.stdin.reconfigure(encoding="utf-8")
 sys.stdout.reconfigure(encoding="utf-8", newline="\n")
 BASE = "http://127.0.0.1:" + os.environ.get("ZHIXIANG_PORT", "8186")
+CLIENT_NAME = ""
+OPENER = build_opener(ProxyHandler({}))
+
+
+def connection_event(stage, tool=""):
+    try:
+        api("POST", "/api/connections/event", {"client": os.environ.get("ZHIXIANG_CLIENT", "other"), "client_name": CLIENT_NAME, "stage": stage, "tool": tool})
+    except Exception:
+        pass  # Optional telemetry must never break the actual tool operation.
 
 
 def api(method, path, payload=None):
@@ -20,7 +29,7 @@ def api(method, path, payload=None):
     request = Request(BASE + path, data=body, method=method,
                       headers={"Content-Type": "application/json; charset=utf-8"})
     try:
-        with urlopen(request, timeout=35) as response:
+        with OPENER.open(request, timeout=35) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         try:
@@ -62,6 +71,7 @@ def strings(desc):
 
 
 TOOLS = [
+    tool("zhixiang_open_workspace", "获取知向网页入口。在用户要求查看界面时，可用客户端内置浏览器打开该地址；无浏览器时展示链接。", {}),
     tool("zhixiang_search", "用固定版本 DSH 原生搜索寻找真实网页来源；返回候选和 question_id。摘要不是原文。",
          {"question": string("要判断的问题"), "period": string("时间范围"),
           "focus": {"type": "string", "enum": ["general", "official", "perspectives"]},
@@ -89,6 +99,9 @@ TOOLS = [
 
 
 def call_tool(name, args):
+    if name == "zhixiang_open_workspace":
+        health = api("GET", "/api/health")
+        return {"url": BASE + "/", "version": health.get("version"), "message": "可在本机客户端的内置浏览器打开知向。网页与本组工具共用资料和判断。"}
     if name == "zhixiang_search":
         q = wait_job(api("POST", "/api/search", {k: args[k] for k in ("question", "period", "focus", "query", "question_id") if k in args}))
         return {"question_id": q["id"], "title": q["title"], "search_report": q.get("search_report"), "search_attempt": q.get("search_attempt")}
@@ -133,6 +146,7 @@ def respond(ident, result=None, error=None):
 
 
 def handle(req):
+    global CLIENT_NAME
     if not isinstance(req, dict) or req.get("jsonrpc") != "2.0" or not isinstance(req.get("method"), str):
         return respond(req.get("id") if isinstance(req, dict) else None,
                        error={"code": -32600, "message": "Invalid Request"})
@@ -142,10 +156,14 @@ def handle(req):
     if not isinstance(params, dict):
         return respond(ident, error={"code": -32602, "message": "Invalid params"})
     if method == "initialize":
+        info = params.get("clientInfo") or {}
+        CLIENT_NAME = str(info.get("name", ""))[:80] if isinstance(info, dict) else ""
+        connection_event("initialized")
         requested = params.get("protocolVersion", "2025-03-26")
         version = requested if requested in ("2024-11-05", "2025-03-26", "2025-06-18", "2026-07-28") else "2025-03-26"
         return respond(ident, {"protocolVersion": version, "capabilities": {"tools": {"listChanged": False}},
-                               "serverInfo": {"name": "zhixiang", "version": "3.1.0"}})
+                               "serverInfo": {"name": "zhixiang", "version": "3.1.1"},
+                               "instructions": "知向保存本机的问题、原文和判断。用户要求打开知向时先调用 zhixiang_open_workspace，并在可用的内置浏览器打开返回网址。只有用户明确确认时才保存判断；网页摘要不是已读原文。"})
     if method == "ping":
         return respond(ident, {})
     if method == "tools/list":
@@ -158,6 +176,7 @@ def handle(req):
             return respond(ident, error={"code": -32602, "message": "Invalid tool arguments"})
         try:
             value = call_tool(name, args)
+            connection_event("tool_called", name)
             return respond(ident, {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "isError": False})
         except (ValueError, KeyError, TypeError) as error:
             return respond(ident, {"content": [{"type": "text", "text": str(error)}], "isError": True})

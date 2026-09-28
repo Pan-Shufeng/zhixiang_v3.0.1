@@ -1,4 +1,8 @@
-# 知向 × DSH 本地接口（3.1.0-dsh）
+# 知向多客户端本地接口（3.1.1-connect）
+
+新增 `GET /api/connections` 返回三类客户端配置状态与历史握手/工具调用记录；不返回客户端其他配置或 Key。`POST /api/connections/install` 与 `/remove` 接受 `client: codex|workbuddy`，保留其他服务、备份原配置，仅修改本连接。`/dsh-patch` 生成当前解压路径的 DSH 覆盖层，`/dsh-launch` 在找到已有 DSH 且 3181 未被占用时启动。`/event` 仅保存连接阶段、客户端名、工具名和时间，不保存会话内容；它是本机运行记录，不是安全审计或在线心跳。
+
+`packaging/mcp_entry.py` 按需启动本份知向，检查实例归属，日志写 stderr，MCP JSON-RPC 写 stdout。新增第十个工具 `zhixiang_open_workspace` 获取同后端的本机网页地址，客户端自行决定如何打开浏览器。云端客户端不能直接访问本地地址。
 
 默认本地网页 `http://127.0.0.1:8186`；`GET /api/health` 返回应用身份、版本和进程号，`GET /api/bootstrap` 返回问题、来源、设置及构建时间。独立网页和 DSH MCP 调用同一个本地后端与数据目录。
 

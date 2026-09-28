@@ -31,9 +31,10 @@ import uuid
 import webbrowser
 
 import requests
+import connections
 from search_web import SearchClient, SearchError, SearchSettings, build_query
 
-VERSION = "3.1.0-dsh"
+VERSION = "3.1.1-connect"
 ROOT = Path(__file__).resolve().parent.parent
 SEEDS = Path(__file__).resolve().parent / "seed_data"
 MAX_DOWNLOAD = 15_000_000
@@ -1220,6 +1221,8 @@ class Handler(BaseHTTPRequestHandler):
             path = unquote(urlparse(self.path).path)
             if path == "/api/health":
                 return self._send({"ok": True, "version": VERSION, "app_id": "zhixiang-web", "process_id": os.getpid()})
+            if path == "/api/connections":
+                return self._send(connections.status(self.server.server_port))
             if path == "/api/bootstrap":
                 return self._send(app.bootstrap())
             if path == "/api/settings":
@@ -1266,6 +1269,22 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._body()
             app = self.server.app
             path = unquote(urlparse(self.path).path)
+            if path.startswith("/api/connections/"):
+                try:
+                    action = path.rsplit("/", 1)[-1]
+                    port = self.server.server_port
+                    if action == "event":
+                        return self._send(connections.record_event(payload))
+                    if action in ("install", "remove"):
+                        return self._send(connections.configure(payload.get("client"), action == "remove", port=port))
+                    if action == "dsh-patch":
+                        patch = connections.dsh_patch(port)
+                        return self._send({"command": 'dsh web --patch "' + str(patch) + '" --port 3181', "path": str(patch)})
+                    if action == "dsh-launch":
+                        return self._send(connections.launch_existing_dsh(port))
+                except (ValueError, OSError) as error:
+                    raise UserError(str(error)) from None
+                raise UserError("没有这个连接操作。", 404)
             if path == "/api/settings":
                 return self._send(app.settings.update(payload))
             if path == "/api/search/settings":

@@ -31,6 +31,7 @@ def main():
                DEEPSEEK_API_KEY=config["api_key"],
                ZHIXIANG_PYTHON=str(python),
                ZHIXIANG_MCP_SCRIPT=str(ROOT / "backend" / "mcp_server.py"),
+               ZHIXIANG_CLIENT="dsh",
                ZHIXIANG_PORT="8186")
     print("正在打开 DSH 对话；它通过 MCP 使用同一份知向资料与判断。", flush=True)
     return subprocess.call([str(node), str(cli), "web", "--patch", str(patch), "--port", "3180"], cwd=ROOT / "dsh", env=env)

@@ -175,12 +175,13 @@ def main():
     (stage / "data").mkdir()
     (stage / "config").mkdir()
     (stage / "config" / "trial.json").write_text(json.dumps(trial, ensure_ascii=False, indent=2), encoding="utf-8")
-    (stage / "build.json").write_text(json.dumps({"version": "3.1.0-dsh", "built_at": time.strftime("%Y-%m-%d %H:%M"), "dsh_version": "0.1.7-rc.2"}, ensure_ascii=False), encoding="utf-8")
+    (stage / "build.json").write_text(json.dumps({"version": "3.1.1-connect", "built_at": time.strftime("%Y-%m-%d %H:%M"), "dsh_version": "0.1.7-rc.2"}, ensure_ascii=False), encoding="utf-8")
     (stage / "packaging").mkdir()
     shutil.copy2(HERE / "launcher.py", stage / "packaging" / "launcher.py")
     shutil.copy2(HERE / "launch_dsh.py", stage / "packaging" / "launch_dsh.py")
+    shutil.copy2(HERE / "mcp_entry.py", stage / "packaging" / "mcp_entry.py")
     shutil.copy2(HERE / "runtime_manifest.json", stage / "packaging" / "runtime_manifest.json")
-    for name in ("启动知向联网版.cmd", "停止知向联网版.cmd", "启动知向MCP.cmd", "启动DSH对话.cmd", "MCP配置示例.json", "使用说明.md", "先读我.txt"):
+    for name in ("启动知向联网版.cmd", "停止知向联网版.cmd", "启动知向MCP.cmd", "启动DSH对话.cmd", "连接我的AI客户端.cmd", "MCP配置示例.json", "使用说明.md", "先读我.txt"):
         shutil.copy2(ROOT / name, stage / name)
     # cmd.exe can misparse LF-only batch files, especially with UTF-8 paths.
     for batch in stage.glob("*.cmd"):
@@ -207,7 +208,7 @@ def main():
                 manifest[relative] = hashlib.sha256(file.read_bytes()).hexdigest()
     (stage / "packaging" / "file_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    output = args.output_dir / "知向_DSH集成版_Windows体验包.zip"
+    output = args.output_dir / "知向_多客户端连接版_Windows体验包.zip"
     temp = build_root / "package.zip"
     with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for file in sorted(stage.rglob("*")):
