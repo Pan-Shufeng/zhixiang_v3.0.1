@@ -4,6 +4,8 @@ from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import threading
 from urllib.parse import urlparse, urlunparse
 import uuid
@@ -45,7 +47,7 @@ def clean_url(value):
         return ""
 
 
-def relevance(query, item):
+def relevance(query, item, allow_uncertain=False):
     """A transparent lexical screen, not a claim of semantic verification."""
     text = " ".join(str(item.get(k, "")) for k in ("title", "snippet", "url")).lower()
     parsed = urlparse(item["url"])
@@ -62,7 +64,13 @@ def relevance(query, item):
     chinese = [term for term in chinese if term not in {'如何', '什么', '我们', '可以', '公司', '情况', '官方', '原文', '研究', '争议', '局限', '是否', '哪些', '以及', '影响'}]
     terms = list(dict.fromkeys(latin + chinese))
     matches = [term for term in terms if term in text]
+    requested_years = set(re.findall(r"(?<!\d)20\d{2}(?!\d)", query))
+    result_years = set(re.findall(r"(?<!\d)20\d{2}(?!\d)", text))
+    if requested_years and result_years and not (requested_years & result_years):
+        return "partial", "标题与摘要显示的年份和所问年份不同；只能作为对照线索，不能直接回答。"
     if terms and not matches:
+        if allow_uncertain:
+            return "partial", "标题与摘要未匹配查询词；可能是跨语言结果，请先核对原文。"
         return "excluded", "标题与摘要没有匹配主题关键词"
     financial = bool(re.search(r"annual\s+report|financial\s+(?:results|report)|年报|财报|财务|营收|利润", query, re.I))
     finance_match = bool(re.search(r"annual|financial|(?:quarter|year).{0,20}results|revenue|profit|earnings|10-k|/ar\d{2}(?:/|\b)|年报|财报|财务|营收|利润|业绩", text, re.I))
@@ -75,11 +83,12 @@ def relevance(query, item):
 
 
 class SearchSettings:
-    """Search credentials are separate from model credentials; never serialized publicly."""
-    def __init__(self, directory):
+    """The default DSH provider reuses the configured DeepSeek model credential."""
+    def __init__(self, directory, model_settings=None):
         self.path = Path(directory).resolve() / "search.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.model_settings = model_settings
 
     def config(self):
         with self.lock:
@@ -87,18 +96,21 @@ class SearchSettings:
                 value = json.loads(self.path.read_text(encoding="utf-8-sig"))
             except (OSError, ValueError):
                 value = {}
-            return {"provider": value.get("provider", "public"), "api_key": value.get("api_key", "")}
+            return {"provider": value.get("provider", "dsh"), "api_key": value.get("api_key", "")}
 
     def public(self):
         config = self.config()
-        return {"provider": config["provider"], "configured": config["provider"] == "public" or bool(config["api_key"]), "tavily_configured": bool(config["api_key"]), "notice": "公共搜索使用 Bing RSS，无需搜索 Key；可用性与结果范围由搜索服务决定。Tavily 使用你配置的账户额度。搜索摘要是待查线索，读取原文成功后才能用于分析。"}
+        model = self.model_settings.config() if self.model_settings else {}
+        dsh_ready = bool(model.get("api_key")) and model.get("provider") == "deepseek"
+        configured = dsh_ready if config["provider"] == "dsh" else config["provider"] == "public" or bool(config["api_key"])
+        return {"provider": config["provider"], "configured": configured, "dsh_configured": dsh_ready, "tavily_configured": bool(config["api_key"]), "notice": "默认搜索调用固定版本 DSH 的 DeepSeek 原生搜索，使用模型账户额度。搜索结果只是线索，读取原文成功后才能用于分析；公共 Bing RSS 和 Tavily 可手动选择。"}
 
     def update(self, payload):
         with self.lock:
             config = self.config()
             provider = payload.get("provider", config["provider"])
-            if provider not in ("public", "tavily"):
-                raise SearchError("请选择公共搜索或 Tavily。")
+            if provider not in ("dsh", "public", "tavily"):
+                raise SearchError("请选择 DeepSeek 原生搜索、公共搜索或 Tavily。")
             supplied = payload.get("api_key", "")
             if not isinstance(supplied, str) or len(supplied) > 1000:
                 raise SearchError("搜索 Key 格式不正确。")
@@ -130,12 +142,17 @@ def build_query(question, period="", query="", focus="general"):
 
 
 class SearchClient:
-    def __init__(self, settings):
+    def __init__(self, settings, model_settings=None):
         self.settings = settings
+        self.model_settings = model_settings
 
-    def search(self, query):
+    def search(self, query, focus="general"):
         config = self.settings.config()
-        if config["provider"] == "tavily":
+        if config["provider"] == "dsh":
+            items = self.dsh_native(query)
+            provider = "dsh-deepseek-official"
+            notice = "由固定版本 DSH DeepSeek 原生搜索返回结构化线索；搜索使用 DeepSeek 账户额度，摘要和日期仍需核对原文。"
+        elif config["provider"] == "tavily":
             items = self.tavily(query, config["api_key"])
             provider = "tavily"
             notice = "Tavily 返回的摘要仅是搜索线索；日期来自搜索服务，尚未在原文中核对。"
@@ -150,11 +167,13 @@ class SearchClient:
                 continue
             seen.add(url)
             candidate = {"id": "candidate_" + uuid.uuid4().hex[:16], "title": plain(item.get("title"), 250) or urlparse(url).hostname, "url": url, "publisher": urlparse(url).hostname, "snippet": plain(item.get("snippet")), "status": "candidate", "provenance": "search_snippet", "date_note": "搜索服务提供的日期未核对原文"}
-            quality, reason = relevance(query, candidate)
+            quality, reason = relevance(query, candidate, allow_uncertain=provider == "dsh-deepseek-official")
             if quality == "excluded":
                 filtered_count += 1
                 continue
             candidate.update(relevance=quality, relevance_notice=reason, search_query=query)
+            domain = urlparse(url).hostname or ""
+            candidate["official_hint"] = bool(re.search(r"(?:^|\.)(?:investor|ir|gov|edu)\.", domain) or domain.endswith((".gov.cn", ".gov", ".edu.cn")) or "hkexnews.hk" in domain)
             if item.get("published_at"):
                 candidate["published_at"] = plain(item["published_at"], 100)
             if item.get("search_index_date"):
@@ -170,14 +189,17 @@ class SearchClient:
             notice += f" 已排除{filtered_count}条登录页或未匹配主题词的结果。"
         return {"query": query, "provider": provider, "searched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "candidates": candidates, "notice": notice, "filtered_count": filtered_count, "scope": "实时联网搜索候选；尚未自动读取正文"}
 
-    def merge_reports(self, reports):
+    def merge_reports(self, reports, focus="general"):
         candidates, seen = [], set()
         for report in reports:
             for item in report["candidates"]:
                 if item["url"] not in seen:
                     seen.add(item["url"])
                     candidates.append(item)
-        candidates.sort(key=lambda c: c.get("relevance") != "matched")
+        if focus == "official":
+            candidates.sort(key=lambda c: (not c.get("official_hint", False), c.get("relevance") != "matched"))
+        else:
+            candidates.sort(key=lambda c: (c.get("relevance") != "matched", not c.get("official_hint", False)))
         return {**reports[0], "candidates": candidates[:10], "actual_queries": [r["query"] for r in reports], "search_runs": [{k: r.get(k) for k in ("query", "provider", "searched_at", "notice", "filtered_count")} for r in reports], "notice": " ".join(dict.fromkeys(r.get("notice", "") for r in reports)), "filtered_count": sum(r.get("filtered_count", 0) for r in reports)}
 
     def _request(self, method, url, **kwargs):
@@ -203,6 +225,43 @@ class SearchClient:
             raise SearchError("暂时无法连接搜索服务，请检查网络或稍后重试。已有资料与判断仍保留。") from None
         finally:
             session.close()
+
+    def dsh_native(self, query):
+        model = self.model_settings.config() if self.model_settings else {}
+        if model.get("provider") != "deepseek" or not model.get("api_key"):
+            raise SearchError("DeepSeek 原生搜索需要 DeepSeek 试用或个人 API 设置；当前未配置。")
+        root = Path(__file__).resolve().parent.parent
+        node = root / "runtime" / "node" / "node.exe"
+        if not node.is_file():
+            node = shutil.which("node")
+        bridge = root / "dsh" / "search.mjs"
+        if not node or not bridge.is_file():
+            raise SearchError("DSH 搜索组件尚未安装完整，请使用完整体验包或按开发说明安装。")
+        try:
+            run = subprocess.run(
+                [str(node), str(bridge)],
+                input=json.dumps({"query": query, "apiKey": model["api_key"]}, ensure_ascii=False),
+                text=True, encoding="utf-8", capture_output=True, timeout=55,
+                cwd=str(root / "dsh"), check=False,
+            )
+            result = json.loads(run.stdout)
+        except subprocess.TimeoutExpired:
+            raise SearchError("DSH 搜索超时；本次没有采用不完整结果。") from None
+        except (OSError, ValueError, UnicodeError):
+            raise SearchError("DSH 搜索组件未返回可读结果；请检查完整包和网络。") from None
+        if not result.get("ok"):
+            code = result.get("code")
+            if code == "authentication":
+                raise SearchError("DeepSeek 搜索认证失败，请检查试用额度或在设置中填写自己的 Key。")
+            if code == "quota":
+                raise SearchError("DeepSeek 搜索额度不足或受到限流，本次没有自动换账户。")
+            if code == "timeout":
+                raise SearchError("DeepSeek 搜索超时，本次没有采用不完整结果。")
+            raise SearchError("DSH DeepSeek 搜索服务本次未提供可用结果；没有采用模型正文或模拟结果。")
+        sources = result.get("result", {}).get("sources", [])
+        if not isinstance(sources, list):
+            raise SearchError("DSH 搜索响应缺少结构化来源。")
+        return [{"title": item.get("title", ""), "url": item.get("url", ""), "snippet": item.get("snippet", ""), "published_at": item.get("publishedAt", "")} for item in sources if isinstance(item, dict)]
 
     def bing_rss(self, query):
         data = self._request("GET", "https://www.bing.com/search", params={"q": query, "format": "rss"}, headers={"User-Agent": "ZhixiangWeb/1.1 PublicSearch"})

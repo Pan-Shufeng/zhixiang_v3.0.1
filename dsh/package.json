@@ -1,0 +1,9 @@
+{
+  "name": "zhixiang-dsh-runtime",
+  "private": true,
+  "version": "0.1.0",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-web-search-deepseek": "0.1.7-rc.2"
+  }
+}

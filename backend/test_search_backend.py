@@ -19,10 +19,13 @@ class SearchTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.model = FixtureModel()
         self.app = server.Application(self.root / 'data', self.root / 'config', model=self.model, fallback=False)
+        # These offline fixtures specifically exercise the optional public
+        # provider. Production defaults to the genuine DSH provider.
+        self.app.search_settings.update({'provider': 'public'})
         self.report = {'query': 'fixture only', 'provider': 'fixture_only', 'searched_at': server.now(), 'candidates': [
             {'id': 'c1', 'title': 'Fixture first', 'url': 'https://example.com/one', 'snippet': 'SEARCH SNIPPET MUST NOT BECOME SOURCE', 'status': 'candidate'},
             {'id': 'c2', 'title': 'Fixture blocked', 'url': 'https://example.com/two', 'snippet': 'BLOCKED SEARCH SNIPPET', 'status': 'candidate'}]}
-        self.app.search_client.search = lambda query: json.loads(json.dumps({**self.report, 'query': query}))
+        self.app.search_client.search = lambda query, focus='general': json.loads(json.dumps({**self.report, 'query': query}))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -52,7 +55,7 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(len(q['search_report']['candidates']), 2)
 
     def test_empty_results_never_substitute_local_case(self):
-        self.app.search_client.search = lambda query: {'query': query, 'provider': 'fixture_empty', 'searched_at': server.now(), 'candidates': []}
+        self.app.search_client.search = lambda query, focus='general': {'query': query, 'provider': 'fixture_empty', 'searched_at': server.now(), 'candidates': []}
         q = self.wait(self.app.search({'question': '东方甄选并不存在的独有问法'}))['result']
         self.assertEqual(q['search_report']['candidates'], [])
         self.assertEqual(q['source_ids'], [])
@@ -124,7 +127,7 @@ class SearchTests(unittest.TestCase):
     def test_concurrent_search_cannot_mutate_active_question(self):
         q = self.question()
         started, release = threading.Event(), threading.Event()
-        def blocked(query):
+        def blocked(query, focus='general'):
             started.set()
             release.wait(3)
             return {**self.report, 'query': query}
@@ -209,7 +212,7 @@ class SearchTests(unittest.TestCase):
         calls = []
         self.model.complete = lambda system, prompt: calls.append(json.loads(prompt)) or {'queries': ['first short query', 'second short query', 'third ignored']}
         queries = []
-        self.app.search_client.search = lambda query: queries.append(query) or {**self.report, 'query': query}
+        self.app.search_client.search = lambda query, focus='general': queries.append(query) or {**self.report, 'query': query}
         q = self.question()
         self.assertEqual(len(calls), 1)
         self.assertEqual(queries, ['first short query', 'second short query'])
@@ -330,6 +333,14 @@ class SearchTests(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
             thread.join()
+
+    def test_explicit_fiscal_year_does_not_promote_other_year_as_match(self):
+        candidate = {'url': 'https://example.com/fy2026',
+                     'title': 'Microsoft FY2026 Earnings Release',
+                     'snippet': 'FY2026 revenue and profit'}
+        grade, reason = relevance('微软2025财年营收和利润是多少？', candidate, allow_uncertain=True)
+        self.assertEqual(grade, 'partial')
+        self.assertIn('年份', reason)
 
 
 if __name__ == '__main__':

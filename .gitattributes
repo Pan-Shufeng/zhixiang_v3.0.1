@@ -1,0 +1,3 @@
+# cmd.exe needs CRLF line endings; keep batch files byte-for-byte in source archives.
+*.cmd -text
+*.bat -text

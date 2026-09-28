@@ -1,0 +1,13 @@
+# Added after the official web profile. This is a real DSH MCP client entry,
+# distinct from the DSH native-search provider used by the Zhixiang web page.
+- insert:
+    - id: zhixiang-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: zhixiang
+        transport: stdio
+        command: !!js process.env.ZHIXIANG_PYTHON
+        args:
+          - !!js process.env.ZHIXIANG_MCP_SCRIPT
+        toolCallTimeoutMs: 180000
+        failOnStartupError: true

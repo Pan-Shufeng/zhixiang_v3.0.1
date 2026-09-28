@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from html.parser import HTMLParser
 from http import HTTPStatus
@@ -33,7 +33,7 @@ import webbrowser
 import requests
 from search_web import SearchClient, SearchError, SearchSettings, build_query
 
-VERSION = "1.1.0-web"
+VERSION = "3.1.0-dsh"
 ROOT = Path(__file__).resolve().parent.parent
 SEEDS = Path(__file__).resolve().parent / "seed_data"
 MAX_DOWNLOAD = 15_000_000
@@ -216,8 +216,9 @@ class Settings:
         trial = load_json(self.directory / "trial.json", {})
         if trial.get("api_key"):
             return trial
-        external = Path(r"C:\Users\shufe\.config\ai-course\deepseek.env")
-        if self.fallback and external.is_file():
+        external_name = os.environ.get("ZHIXIANG_TRIAL_ENV", "").strip()
+        external = Path(external_name) if external_name else None
+        if self.fallback and external and external.is_file():
             values = {}
             for line in external.read_text(encoding="utf-8-sig").splitlines():
                 if "=" in line and not line.lstrip().startswith("#"):
@@ -676,8 +677,8 @@ class Application:
     def __init__(self, data_dir, config_dir, seed_dir=SEEDS, model=None, fallback=True):
         self.store = Store(data_dir, seed_dir)
         self.settings = Settings(config_dir, fallback)
-        self.search_settings = SearchSettings(config_dir)
-        self.search_client = SearchClient(self.search_settings)
+        self.search_settings = SearchSettings(config_dir, self.settings)
+        self.search_client = SearchClient(self.search_settings, self.settings)
         self.model = model or Model(self.settings, data_dir)
         self.concurrency = threading.Semaphore(2)
         self.active_questions = set()
@@ -685,7 +686,7 @@ class Application:
         self.fetch = lambda url: fetch_source(url, self.store.find_fingerprint)
 
     def bootstrap(self):
-        return {"questions": self.store.all_questions(), "sources": self.store.all_sources(light=True), "settings": self.settings.public(), "search_settings": self.search_settings.public(), "examples": EXAMPLES}
+        return {"questions": self.store.all_questions(), "sources": self.store.all_sources(light=True), "settings": self.settings.public(), "search_settings": self.search_settings.public(), "examples": EXAMPLES, "runtime": {"version": VERSION, "process_id": os.getpid(), "build": load_json(ROOT / "build.json", {}).get("built_at", "source")}}
 
     def new_question(self, title, period):
         question = {"id": ident("q_"), "title": title, "period": period, "created_at": now(), "updated_at": now(), "source_ids": [], "analysis": None, "judgment": None, "history": [], "comparison": None, "pending_source_ids": []}
@@ -747,12 +748,12 @@ class Application:
                     for index, planned_query in enumerate(plan["queries"], 1):
                         update("searching", f"正在联网搜索公开线索 {index}/{len(plan['queries'])}；还没有读取原文")
                         try:
-                            reports.append(self.search_client.search(planned_query))
+                            reports.append(self.search_client.search(planned_query, focus))
                         except SearchError as error:
                             failures.append({"query": planned_query, "message": str(error)})
                     if not reports:
                         raise SearchError(failures[0]["message"] if failures else "搜索服务未返回结果。")
-                    report = self.search_client.merge_reports(reports)
+                    report = self.search_client.merge_reports(reports, focus)
                     # A successful HTTP response can still produce zero useful
                     # candidates. Give common-language questions one transparent
                     # recovery pass instead of asking the user to guess a brand name.
@@ -762,11 +763,11 @@ class Application:
                         for planned_query in recovery:
                             update("searching", "首轮结果不足，正在换一种更短的公开查询重试")
                             try:
-                                reports.append(self.search_client.search(planned_query))
+                                reports.append(self.search_client.search(planned_query, focus))
                             except SearchError as error:
                                 failures.append({"query": planned_query, "message": str(error)})
                         if len(reports) > 1:
-                            report = self.search_client.merge_reports(reports)
+                            report = self.search_client.merge_reports(reports, focus)
                             plan["queries"].extend(recovery)
                             plan["queries"] = plan["queries"][:5]
                             plan["notice"] += " 首轮没有得到可用候选，已自动换用更短查询重试。"
@@ -793,6 +794,34 @@ class Application:
     def plan_search_queries(self, title, period, focus, fallback_query, explicit, update):
         if explicit:
             return {"mode": "direct", "queries": [fallback_query], "notice": "使用你填写的关键词，没有调用AI整理搜索词。"}
+        if self.search_settings.config()["provider"] == "dsh":
+            # Native DSH search accepts natural language. A "latest earnings"
+            # question also needs an as-of query: otherwise stale first-page
+            # results can look current (observed with a Q1/Q2 report).
+            queries = [fallback_query]
+            match = re.match(r"\s*(.{2,24}?)(?:最近|最新)", title)
+            if match and re.search(r"财报|季报|季度业绩|financial results|earnings", title, re.I):
+                reference = datetime.now(timezone.utc) - timedelta(days=45)
+                # The previous *completed* quarter is a lead, not a claim that
+                # a report has been published. The source date decides that.
+                quarter = (reference.month - 1) // 3
+                year = reference.year
+                if quarter == 0:
+                    year -= 1
+                    quarter = 4
+                queries.insert(0, f"{match.group(1).strip()} {year} 第{quarter}季度 财报 investor 官方")
+            elif re.search(r"哪些信息|先查什么|发展现状.*前景|现状.*发展前景", title) and self.settings.public()["configured"]:
+                update("planning_search", "正在为宽泛问题补充两个有明确资料类型的搜索角度")
+                try:
+                    limits = {"max_tokens": 340, "request_timeout": 25} if isinstance(self.model, Model) else {}
+                    result = self.model.complete(
+                        "只生成最多两条网页搜索查询。保留用户的主体、地区、时间与问题类型；给每条查询一个不同且必要的资料角度。不得回答问题、猜品牌名、编造来源或URL。输出JSON。",
+                        json.dumps({"question": title, "period": period, "today": datetime.now(timezone.utc).date().isoformat(), "schema": {"queries": ["具体资料查询1", "不同角度查询2"]}}, ensure_ascii=False), **limits)
+                    queries.extend(q[:240] for q in strings(result.get("queries"), 2) if not re.search(r"https?://|www\.", q, re.I))
+                except Exception:
+                    pass  # The original question still goes to native search.
+            queries = list(dict.fromkeys(q for q in queries if q.strip()))[:3]
+            return {"mode": "direct", "queries": queries, "notice": "DSH 原生搜索使用自然语言问题；需要时补查时间或不同资料角度。查询不是答案，也没有预设品牌。"}
         if not self.settings.public()["configured"]:
             queries = self._fallback_search_queries(title, period, fallback_query)
             return {"mode": "fallback", "queries": queries, "notice": "没有配置AI，已自动拆分为几种短查询；没有调用模型。"}
@@ -818,20 +847,13 @@ class Application:
         """
         base = " ".join(x.strip() for x in (title, period) if x.strip())
         queries = [base]
-        if re.search(r"大疆|DJI", title, re.I) and re.search(r"电助力|电动自行车|自行车", title):
-            queries = [
-                "大疆 电助力自行车 品牌",
-                'DJI electric bike brand Amflow Avinox',
-                "大疆 电助力自行车 官方 品牌",
-            ]
-        else:
-            compact = re.sub(r"[，。！？：；,.!?;:]+", " ", title).strip()
-            compact = re.sub(r"(我想了解|请问|帮我查一下|相关的|情况如何|怎么样)", " ", compact)
-            compact = re.sub(r"\s+", " ", compact).strip()
-            if compact and compact != base:
-                queries.append(compact)
-            if re.search(r"品牌|公司|行业|产品|是谁|有哪些", title):
-                queries.append(compact + " 官方")
+        compact = re.sub(r"[，。！？：；,.!?;:]+", " ", title).strip()
+        compact = re.sub(r"(我想了解|请问|帮我查一下|相关的|情况如何|怎么样)", " ", compact)
+        compact = re.sub(r"\s+", " ", compact).strip()
+        if compact and compact != base:
+            queries.append(compact)
+        if re.search(r"品牌|公司|行业|产品|是谁|有哪些", title):
+            queries.append(compact + " 官方")
         unique = []
         for q in queries:
             q = q[:240].strip()
